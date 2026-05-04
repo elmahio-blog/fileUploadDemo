@@ -12,11 +12,6 @@ public class FileService: IFileService
     {
         _uploadsFolder = Path.Combine(env.ContentRootPath, "Uploads");
     }
-    /*
-    public FileService()
-    {
-        _uploadsFolder = Path.Combine(Directory.GetCurrentDirectory(), "Uploads");
-    }*/
     
     public async Task<FileDto> UploadImageAsync(FileDtoInp input)
     {
