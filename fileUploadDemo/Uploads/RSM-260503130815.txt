@@ -1,0 +1,393 @@
+
+namespace IOTAPI.Utilities.Helpers;
+
+public class UserSessionHelper: IUserSessionHelper
+{
+    private readonly IUserSession _userSession;
+    private readonly IAuthApiHelper _authApiHelper;
+
+    public UserSessionHelper(IUserSession userSession, IAuthApiHelper authApiHelper)
+    {
+        _userSession = userSession;
+        _authApiHelper = authApiHelper;
+    }
+
+    public async Task<(int, string, int, string)> GetUserOrganizationDetailAsync(string userName)
+    {
+        if (string.IsNullOrEmpty(userName))
+            return (0, string.Empty, 0, string.Empty);
+        var result = await _authApiHelper.GetUserOrganizationDetailAsync(userName);
+        return (
+            result.UserId,
+            result.UserName,
+            result.OrganizationId,
+            result.OrganizationName
+        );
+    }
+
+
+    public async Task<(int, string, int, string)> GetMyOrganizationDetailAsync()
+        => await GetUserOrganizationDetailAsync(_userSession.GetUsername());
+    
+}
+
+
+public class OrganizationDetailDto
+{
+  public int OrganizationId { get; set; }
+
+  public string? OrganizationName { get; set; }
+
+  public string UserName { get; set; } = string.Empty;
+
+  public int UserId { get; set; }
+}
+
+=================
+public class UserContext
+{
+  public int UserId { get; set; }
+
+  public string Username { get; set; }
+
+  public int OrganizationId { get; set; }
+
+  public string? OrganizationName { get; set; }
+
+  public string Token { get; set; }
+}
+
+
+public class UserContextMiddleware
+{
+    
+    private readonly RequestDelegate _next;
+    private readonly IServiceScopeFactory _serviceScopeFactory;
+
+    public UserContextMiddleware(RequestDelegate next, IServiceScopeFactory serviceScopeFactory)
+    {
+        _next = next;
+        _serviceScopeFactory = serviceScopeFactory;
+    }
+
+    public async Task InvokeAsync(HttpContext context, UserContext userContext)
+    {
+        
+        using var scope = _serviceScopeFactory.CreateScope();
+        var userSessionHelper = scope.ServiceProvider.GetRequiredService<IUserSessionHelper>();
+        
+        // Initialize the user context for the current request
+        (userContext.UserId, userContext.Username, userContext.OrganizationId, userContext.OrganizationName) = await userSessionHelper.GetMyOrganizationDetailAsync();
+        
+        string authorizationHeader = context.Request.Headers["Authorization"];
+        
+        if (!string.IsNullOrEmpty(authorizationHeader) && authorizationHeader.StartsWith("Bearer "))
+        {
+            userContext.Token = authorizationHeader.Replace("Bearer ", "").Trim();
+        }
+
+        // Proceed with the request pipeline
+        await _next(context);
+    }
+}
+
+==========================
+
+
+//Extension method
+
+public static class ConfigurationExtensions
+{
+    public static WebApplicationBuilder InjectJwt(this WebApplicationBuilder builder)
+    {
+        
+        builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.Events = new JwtBearerEvents
+            {
+                OnMessageReceived = async context =>
+                {
+                    try
+                    {
+                        // Extract Bearer token
+                        var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+                        if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer "))
+                        {
+                            var token = authHeader.Substring("Bearer ".Length);
+
+                            // Decode token to get claims without validation
+                            var handler = new JwtSecurityTokenHandler();
+                            var jwtToken = handler.ReadJwtToken(token);
+
+                            var preferredUsername = jwtToken.Claims.FirstOrDefault(c => c.Type == "preferred_username")
+                                ?.Value;
+
+                            if (!string.IsNullOrEmpty(preferredUsername))
+                            {
+                                // Fetch organization name dynamically
+                                var authApiHelper = context.HttpContext.RequestServices.GetRequiredService<IAuthApiHelper>();
+                                var encryptionHelper = context.HttpContext.RequestServices
+                                    .GetRequiredService<IEncryptionHelper>();
+
+                                var organizationConfig =
+                                    await authApiHelper.GetOrganizationConfigurationAsync(preferredUsername);
+
+                                if (organizationConfig is null)
+                                {
+                                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                                    await context.Response.WriteAsync(
+                                        "Invalid credentials: User does not exist in any organization.");
+                                    return;
+                                }
+
+                                // Fetch client configuration
+                                var configManager = context.HttpContext.RequestServices
+                                    .GetRequiredService<AppSettingsConfigurationManager>();
+                                var appSettings = configManager.GetAppSettings();
+
+                                var updatedKeycloak = appSettings.Keycloak;
+                                
+                                updatedKeycloak.ClientName = encryptionHelper.Decrypt(organizationConfig.ClientName);
+                                updatedKeycloak.ClientId = encryptionHelper.Decrypt(organizationConfig.ClientId);
+                                updatedKeycloak.ClientSecret =
+                                    encryptionHelper.Decrypt(organizationConfig.ClientSecret);
+                                
+
+                                ReplaceKeycloakPlaceholders(appSettings);
+
+                                configManager.UpdateKeycloak(updatedKeycloak);
+
+                                // Dynamically set Authority and Audience
+                                options.Authority = encryptionHelper.Decrypt(organizationConfig.Issuer);
+                                options.Audience = encryptionHelper.Decrypt(organizationConfig.ClientId);
+
+                                // Keep validation behavior
+                                options.TokenValidationParameters.ValidateIssuer = true;
+                                options.TokenValidationParameters.ValidateAudience = false;
+                                options.TokenValidationParameters.ValidateLifetime = true;
+
+                                options.TokenValidationParameters.ValidIssuer = encryptionHelper.Decrypt(organizationConfig.Issuer);
+                                options.TokenValidationParameters.ValidAudience = encryptionHelper.Decrypt(organizationConfig.ClientId);
+
+                                options.TokenValidationParameters.IssuerSigningKeyResolver =
+                                    (token, securityToken, kid, parameters) =>
+                                    {
+                                        var httpClient = new HttpClient();
+                                        var jwksUri =
+                                            $"{encryptionHelper.Decrypt(organizationConfig.Issuer)}" +
+                                            $"/protocol/openid-connect/certs"; // JWKS endpoint URL
+                                        
+                                        var jwks = httpClient.GetStringAsync(jwksUri).Result;
+
+                                        var jsonWebKeySet = new JsonWebKeySet(jwks);
+                                        var key = jsonWebKeySet.Keys.FirstOrDefault(k => k.Kid == kid);
+
+                                        // Return the key as a SecurityKey
+                                        return key != null ? new List<SecurityKey> { key } : null;
+                                    };
+
+                            }
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e);
+                        throw;
+                    }
+                }
+                
+            };
+        });
+
+        return builder;
+    }
+}
+
+
+==========================
+
+
+//Program.cs 
+
+
+builder.Services.AddSwaggerGen(
+    c =>
+    {
+        c.SwaggerDoc("v1", new OpenApiInfo { Title = "IOTAPI", Version = "v1" });
+        
+        
+        #region Bearer Token Authentication
+        
+        c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+        {
+            Description = "Jwt Authurization",
+            Name = "Authorization",
+            In = ParameterLocation.Header,
+            Type = SecuritySchemeType.ApiKey,
+            Scheme ="Bearer"
+        });
+
+        c.AddSecurityRequirement(new OpenApiSecurityRequirement
+        {
+            {
+                new OpenApiSecurityScheme
+                {
+                    Reference = new OpenApiReference
+                    {
+                        Type = ReferenceType.SecurityScheme,
+                        Id = "Bearer"
+                    }
+                },
+                new string[]{}
+            }
+        });
+    
+        #endregion
+        
+        //get the base path of the app
+        var _webHostEnvironment = builder.Services
+            .BuildServiceProvider().GetRequiredService<IWebHostEnvironment>();
+    
+        // Set the comments path for the Swagger JSON and UI. this uses an extension method
+        c.IncludeXmlDocs(_webHostEnvironment);
+
+    });
+
+
+builder.InjectJwt();
+
+
+builder.Services.AddAuthorization();
+
+app.UseMiddleware<UserContextMiddleware>();
+
+==========================
+
+//Encryption helper method
+//make sure to keep saltkey safe in env _saltKey = "IoT@Secured!2025"
+public string Decrypt(string? encryptedInput)
+    {
+        if(string.IsNullOrEmpty(encryptedInput))
+            return String.Empty;
+
+        byte[] keyBytes = Encoding.UTF8.GetBytes(_saltKey);
+        using (Aes aes = Aes.Create())
+        {
+            aes.Key = keyBytes;
+            aes.IV = new byte[16]; // Same initialization vector used in encryption
+            
+            using (var decryptor = aes.CreateDecryptor())
+            using (var ms = new MemoryStream(Convert.FromBase64String(encryptedInput)))
+            using (var cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read))
+            using (var sr = new StreamReader(cs))
+            {
+                return sr.ReadToEnd();
+            }
+        }
+    }
+//Auth api helper
+// make sure to keep it secret in env_authApiBaseUr"https://dev.auth.machinesensiot.com/api"
+
+
+    public async Task<OrganizationDetailDto> GetUserOrganizationDetailAsync(string userName)
+    {
+        
+        var requestUrl = $"{_authApiBaseUrl}/Auth/GetOrganizationDetailOpen?userName={userName}";
+
+        // Create a new HTTP request message
+        var requestMessage = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+
+        // Add headers to the request
+        requestMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+        //requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        // Make the API call and get the response
+        
+        
+        return await SendAndDeserializeAsync
+            <OrganizationDetailDto>(requestMessage);
+    }
+    
+	
+    public async Task<OrganizationConfigurationDto?> GetOrganizationConfigurationAsync(string userName)
+    {
+        var requestUrl = $"{_authApiBaseUrl}/Auth/GetOrganizationConfiguration?userName={userName}";
+
+        // Create a new HTTP request message
+        var requestMessage = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+
+        // Add headers to the request
+        requestMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+        //requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        // Make the API call and get the response
+        var response = await _httpClient.SendAsync(requestMessage);
+
+        // Ensure successful status code
+        response.EnsureSuccessStatusCode();
+
+        // Read the response content as a string
+        var content = await response.Content.ReadAsStringAsync();
+        
+        // Deserialize the response content to extract the data.applications
+        var options = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        };
+		
+        var result = JsonSerializer.Deserialize<OrganizationConfigurationDto>(
+            JsonDocument.Parse(content).RootElement.GetProperty("data").GetRawText(),
+            options
+        );
+
+        if(result == null)
+            return new OrganizationConfigurationDto();
+            
+        return result;
+
+    }
+
+
+public class OrganizationConfigurationDto
+{
+  public string ClientName { get; set; } = string.Empty;
+
+  public string Audience { get; set; } = string.Empty;
+
+  public string ClientId { get; set; } = string.Empty;
+
+  public string ClientSecret { get; set; } = string.Empty;
+
+  public string Issuer { get; set; } = string.Empty;
+
+  public int UserId { get; set; }
+
+  public int OrganizationId { get; set; }
+
+  public string OrganizationName { get; set; } = string.Empty;
+
+  public string ChirpstackTenantId { get; set; } = string.Empty;
+
+  public int? OrganizationLogoId { get; set; } = new int?(0);
+
+  public string? OrganizationLogoKey { get; set; } = string.Empty;
+}
+
+///all the entities will be filtere by organizationId to get data for the current tenant 
+
+    private readonly UserContext _userContext;
+	
+query.Where(e => 
+                e.OrganizationId == _userContext.OrganizationId
+                && e.IsAvailable //IsAvailable specifies logical deletion
+            );
+			
+// at the time of creation
+
+            entity.OrganizationId = _userContext.OrganizationId;
+
+            entity.CreatedBy = _userContext.UserId;
+
+            entity.CreatedAt = DateTime.UtcNow;
+            entity.IsAvailable = true;
